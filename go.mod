@@ -1,26 +1,8 @@
 module github.com/jagreehal/autolemetry-go
 
-go 1.23.0
+go 1.21
 
-toolchain go1.23.2
-
-require (
-	github.com/gin-gonic/gin v1.11.0
-	github.com/stretchr/testify v1.11.1
-	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.63.0
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.63.0
-	go.opentelemetry.io/otel v1.38.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.38.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.38.0
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.38.0
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.38.0
-	go.opentelemetry.io/otel/metric v1.38.0
-	go.opentelemetry.io/otel/sdk v1.38.0
-	go.opentelemetry.io/otel/sdk/metric v1.38.0
-	go.opentelemetry.io/otel/trace v1.38.0
-	go.uber.org/zap v1.27.1
-	google.golang.org/grpc v1.75.0
-)
+require github.com/jagreehal/autotel-go v1.0.0
 
 require (
 	github.com/bytedance/sonic v1.14.0 // indirect

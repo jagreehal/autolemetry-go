@@ -1,375 +1,181 @@
+// Package autolemetry redirects to github.com/jagreehal/autotel-go.
+//
+// This package has been renamed to autotel-go.
+// Please update your imports:
+//
+//	// Old
+//	import "github.com/jagreehal/autolemetry-go"
+//
+//	// New
+//	import "github.com/jagreehal/autotel-go"
+//
+// This package will continue to work as a redirect, but we recommend updating to the new import path.
 package autolemetry
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"strings"
-	"sync"
-	"time"
 
-	"go.opentelemetry.io/otel"
-	otlpmetricgrpc "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
-	otlpmetrichttp "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
-	"go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
-
-	"github.com/jagreehal/autolemetry-go/internal/exporters"
+	"github.com/jagreehal/autotel-go"
+	"github.com/jagreehal/autotel-go/middleware"
+	"github.com/jagreehal/autotel-go/subscribers"
+	"github.com/jagreehal/autotel-go/logging"
 )
 
-// EventTracker is an interface for tracking analytics events.
-// This avoids import cycles by not importing the analytics package directly.
-type EventTracker interface {
-	Track(ctx context.Context, event string, properties map[string]any)
-	Shutdown(ctx context.Context) error
-}
-
+// Re-export all main functions
 var (
-	globalTracker   EventTracker
-	globalTrackerMu sync.RWMutex
-	queueFactory    func(cfg *Config, subscribers []Subscriber) EventTracker
+	Init             = autotel.Init
+	InitWithConfig   = autotel.InitWithConfig
+	Start            = autotel.Start
+	Track            = autotel.Track
+	Meter            = autotel.Meter
+	SetAttribute     = autotel.SetAttribute
+	SetAttributes    = autotel.SetAttributes
+	AddEvent         = autotel.AddEvent
+	RecordError      = autotel.RecordError
+	GetTraceID       = autotel.GetTraceID
+	GetSpanID        = autotel.GetSpanID
+	GetVersion       = autotel.GetVersion
+	GetOperationName = autotel.GetOperationName
+	IsTracingEnabled = autotel.IsTracingEnabled
+	SetDuration      = autotel.SetDuration
+	SetHTTPRequestAttributes = autotel.SetHTTPRequestAttributes
+	AddEventWithAttributes   = autotel.AddEventWithAttributes
 )
 
-// RegisterQueueFactory registers a function to create analytics queues.
-// This is called by the analytics package to avoid import cycles.
-// Users should not call this directly.
-func RegisterQueueFactory(factory func(cfg *Config, subscribers []Subscriber) EventTracker) {
-	queueFactory = factory
+// Trace is a generic function wrapper for autotel.Trace
+func Trace[T any](ctx context.Context, name string, fn func(context.Context, Span) (T, error)) (T, error) {
+	return autotel.Trace(ctx, name, fn)
 }
 
-// Init initializes autolemetry with OpenTelemetry SDK using functional options.
-// Returns a cleanup function that should be called on shutdown.
-//
-// This is the recommended way to initialize autolemetry for most users.
-//
-// Example:
-//
-//	cleanup, err := autolemetry.Init(ctx,
-//	    autolemetry.WithService("my-service"),
-//	    autolemetry.WithEndpoint("http://localhost:4318"),
-//	)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer cleanup()
-func Init(ctx context.Context, opts ...Option) (func(), error) {
-	cfg := defaultConfig()
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	return initWithConfig(ctx, cfg)
+// TraceNoError is a generic function wrapper for autotel.TraceNoError
+func TraceNoError[T any](ctx context.Context, name string, fn func(context.Context, Span) T) T {
+	return autotel.TraceNoError(ctx, name, fn)
 }
 
-// InitWithConfig initializes autolemetry with a custom Config.
-// This provides advanced users with full control over configuration.
-//
-// Most users should use Init() with functional options instead.
-//
-// Example:
-//
-//	cfg := autolemetry.DefaultConfig()
-//	cfg.ServiceName = "my-service"
-//	cfg.Endpoint = "custom:4318"
-//	cfg.Sampler = trace.AlwaysSample() // Custom sampler
-//	cleanup, err := autolemetry.InitWithConfig(ctx, cfg)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer cleanup()
-func InitWithConfig(ctx context.Context, cfg *Config) (func(), error) {
-	return initWithConfig(ctx, cfg)
+// TraceVoid is a wrapper for autotel.TraceVoid
+func TraceVoid(ctx context.Context, name string, fn func(context.Context, Span) error) error {
+	return autotel.TraceVoid(ctx, name, fn)
 }
 
-func initWithConfig(ctx context.Context, cfg *Config) (func(), error) {
-	applyEnvOverrides(cfg)
-	applyBackendPreset(cfg)
-
-	if cfg.Debug == nil {
-		enabled := ShouldEnableDebug(nil)
-		cfg.Debug = &enabled
-	}
-
-	if *cfg.Debug {
-		EnableDebug()
-	} else {
-		DisableDebug()
-	}
-
-	// Build resource attributes
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(cfg.ServiceName),
-			semconv.ServiceVersion(cfg.ServiceVersion),
-			semconv.DeploymentEnvironment(cfg.Environment),
-		),
-		resource.WithFromEnv(), // Discover resource from OTEL_RESOURCE_ATTRIBUTES env
-		resource.WithProcess(), // Add process attributes
-		resource.WithOS(),      // Add OS attributes
-		resource.WithHost(),    // Add host attributes
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create resource: %w", err)
-	}
-
-	exportersList, err := buildExporters(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := setupMetrics(ctx, res, cfg); err != nil {
-		return nil, err
-	}
-
-	processors := make([]trace.SpanProcessor, 0, len(exportersList)+len(cfg.SpanProcessors))
-	processors = append(processors, cfg.SpanProcessors...)
-	for _, exp := range exportersList {
-		processors = append(processors, trace.NewBatchSpanProcessor(exp,
-			trace.WithBatchTimeout(cfg.BatchTimeout),
-			trace.WithMaxQueueSize(cfg.MaxQueueSize),
-			trace.WithMaxExportBatchSize(cfg.MaxExportBatchSize),
-		))
-	}
-
-	// Use AlwaysSample in debug mode to see all spans
-	sampler := cfg.Sampler
-	if IsDebugEnabled() {
-		sampler = trace.AlwaysSample()
-		debugPrint("Using AlwaysSample sampler for debug mode")
-	}
-
-	// Create tracer provider
-	providerOpts := []trace.TracerProviderOption{
-		trace.WithResource(res),
-		trace.WithSampler(sampler),
-	}
-	for _, processor := range processors {
-		providerOpts = append(providerOpts, trace.WithSpanProcessor(processor))
-	}
-
-	tp := trace.NewTracerProvider(providerOpts...)
-
-	// Set global tracer provider
-	otel.SetTracerProvider(tp)
-
-	// Set global production hardening features
-	if cfg.RateLimiter != nil {
-		setGlobalRateLimiter(cfg.RateLimiter)
-	}
-	if cfg.CircuitBreaker != nil {
-		setGlobalCircuitBreaker(cfg.CircuitBreaker)
-	}
-	if cfg.PIIRedactor != nil {
-		setGlobalPIIRedactor(cfg.PIIRedactor)
-	}
-
-	// Create global analytics queue if subscribers are provided
-	if len(cfg.Subscribers) > 0 && queueFactory != nil {
-		globalTrackerMu.Lock()
-		globalTracker = queueFactory(cfg, cfg.Subscribers)
-		globalTrackerMu.Unlock()
-	}
-
-	// Return cleanup function
-	cleanup := func() {
-		_ = tp.Shutdown(context.Background())
-
-		// Shutdown global analytics queue if it exists
-		globalTrackerMu.Lock()
-		if globalTracker != nil {
-			_ = globalTracker.Shutdown(context.Background())
-			globalTracker = nil
-		}
-		globalTrackerMu.Unlock()
-	}
-
-	return cleanup, nil
+// TraceFunc is a wrapper for autotel.TraceFunc
+func TraceFunc(ctx context.Context, name string, fn any) any {
+	return autotel.TraceFunc(ctx, name, fn)
 }
 
-// Track sends an analytics event to the global queue (if configured).
-// This is a convenience function that uses the queue created during Init().
-// If no subscribers were provided during Init(), this function does nothing.
-//
-// Example:
-//
-//	autolemetry.Track(ctx, "user_signed_up", map[string]any{
-//	    "user_id": "123",
-//	    "plan":    "premium",
-//	})
-func Track(ctx context.Context, event string, properties map[string]any) {
-	globalTrackerMu.RLock()
-	tracker := globalTracker
-	globalTrackerMu.RUnlock()
-
-	if tracker != nil {
-		tracker.Track(ctx, event, properties)
-	}
-}
-
-func setupMetrics(ctx context.Context, res *resource.Resource, cfg *Config) error {
-	if !cfg.MetricsEnabled {
-		return nil
-	}
-
-	exportersList := cfg.MetricExporters
-	if len(exportersList) == 0 {
-		if cfg.Endpoint == "" {
-			// No exporter configured and no endpoint provided; skip metrics setup.
-			return nil
-		}
-
-		exp, err := newOTLPMetricsExporter(ctx, cfg)
-		if err != nil {
-			return fmt.Errorf("failed to create metrics exporter: %w", err)
-		}
-		exportersList = append(exportersList, exp)
-	}
-
-	providerOpts := []sdkmetric.Option{sdkmetric.WithResource(res)}
-	for _, exp := range exportersList {
-		providerOpts = append(providerOpts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp, sdkmetric.WithInterval(cfg.MetricInterval))))
-	}
-
-	mp := sdkmetric.NewMeterProvider(providerOpts...)
-	otel.SetMeterProvider(mp)
-	return nil
-}
-
-func newOTLPMetricsExporter(ctx context.Context, cfg *Config) (sdkmetric.Exporter, error) {
-	if cfg.Protocol == ProtocolHTTP {
-		httpOpts := []otlptmetricOption{
-			otlptmetricWithEndpoint(cfg.Endpoint),
-			otlptmetricWithHeaders(cfg.OTLPHeaders),
-			otlptmetricWithTimeout(cfg.BatchTimeout + 5*time.Second),
-		}
-		if cfg.Insecure {
-			httpOpts = append(httpOpts, otlptmetricWithInsecure())
-		}
-		return otlpmetrichttp.New(ctx, httpOpts...)
-	}
-
-	grpcOpts := []otlpgmetricOption{
-		otlpgmetricWithEndpoint(cfg.Endpoint),
-		otlpgmetricWithHeaders(cfg.OTLPHeaders),
-		otlpgmetricWithTimeout(cfg.BatchTimeout + 5*time.Second),
-	}
-	if cfg.Insecure {
-		grpcOpts = append(grpcOpts, otlpmetricgrpc.WithInsecure())
-	}
-	return otlpmetricgrpc.New(ctx, grpcOpts...)
-}
-
-// Aliases to keep option slices readable.
+// Re-export types
 type (
-	otlptmetricOption = otlpmetrichttp.Option
-	otlpgmetricOption = otlpmetricgrpc.Option
+	Span         = autotel.Span
+	Config       = autotel.Config
+	Option       = autotel.Option
+	Protocol     = autotel.Protocol
+	EventTracker = autotel.EventTracker
+	TraceContext = autotel.TraceContext
+	Metric       = autotel.Metric
 )
 
-func otlptmetricWithEndpoint(e string) otlptmetricOption { return otlpmetrichttp.WithEndpoint(e) }
-func otlptmetricWithHeaders(h map[string]string) otlptmetricOption {
-	return otlpmetrichttp.WithHeaders(h)
-}
-func otlptmetricWithTimeout(d time.Duration) otlptmetricOption { return otlpmetrichttp.WithTimeout(d) }
-func otlptmetricWithInsecure() otlptmetricOption               { return otlpmetrichttp.WithInsecure() }
+// Re-export constants
+const (
+	ProtocolHTTP = autotel.ProtocolHTTP
+	ProtocolGRPC = autotel.ProtocolGRPC
+	Version      = autotel.Version
+)
 
-func otlpgmetricWithEndpoint(e string) otlpgmetricOption { return otlpmetricgrpc.WithEndpoint(e) }
-func otlpgmetricWithHeaders(h map[string]string) otlpgmetricOption {
-	return otlpmetricgrpc.WithHeaders(h)
-}
-func otlpgmetricWithTimeout(d time.Duration) otlpgmetricOption { return otlpmetricgrpc.WithTimeout(d) }
+// Re-export middleware functions
+var (
+	HTTPMiddleware         = middleware.HTTPMiddleware
+	HTTPMiddlewareWithOptions = middleware.HTTPMiddlewareWithOptions
+	GinMiddleware         = middleware.GinMiddleware
+	GRPCServerHandler     = middleware.GRPCServerHandler
+	GRPCClientHandler     = middleware.GRPCClientHandler
+)
 
-// buildExporters builds the list of span exporters respecting presets and custom exporters.
-func buildExporters(ctx context.Context, cfg *Config) ([]trace.SpanExporter, error) {
-	exportersList := make([]trace.SpanExporter, 0, 4)
-	exportersList = append(exportersList, cfg.SpanExporters...)
+// Re-export subscriber types and functions
+var (
+	NewPostHogSubscriber   = subscribers.NewPostHogSubscriber
+	NewMixpanelSubscriber  = subscribers.NewMixpanelSubscriber
+	NewAmplitudeSubscriber = subscribers.NewAmplitudeSubscriber
+	NewWebhookSubscriber   = subscribers.NewWebhookSubscriber
+	NewQueue              = subscribers.NewQueue
+	NewQueueWithConfig    = subscribers.NewQueueWithConfig
+	NewInMemorySubscriber = subscribers.NewInMemorySubscriber
+)
 
-	// Base OTLP exporter (only when endpoint configured)
-	if cfg.Endpoint != "" {
-		exp, err := newOTLPExporter(ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		exportersList = append(exportersList, exp)
-	}
+// Re-export subscriber types
+type (
+	Subscriber        = subscribers.Subscriber
+	PostHogSubscriber = subscribers.PostHogSubscriber
+	MixpanelSubscriber = subscribers.MixpanelSubscriber
+	AmplitudeSubscriber = subscribers.AmplitudeSubscriber
+	WebhookSubscriber = subscribers.WebhookSubscriber
+	InMemorySubscriber = subscribers.InMemorySubscriber
+	InMemoryEvent     = subscribers.InMemoryEvent
+	Queue            = subscribers.Queue
+	QueueConfig      = subscribers.QueueConfig
+)
 
-	// Console exporter for debug ergonomics
-	if IsDebugEnabled() {
-		exportersList = append(exportersList, exporters.NewConsoleExporter())
-	}
+// Re-export subscriber option types
+type (
+	PostHogOption   = subscribers.PostHogOption
+	MixpanelOption  = subscribers.MixpanelOption
+	AmplitudeOption = subscribers.AmplitudeOption
+	WebhookOption   = subscribers.WebhookOption
+)
 
-	return exportersList, nil
-}
+// Re-export subscriber option functions
+var (
+	WithPostHogHost        = subscribers.WithPostHogHost
+	WithPostHogDistinctID  = subscribers.WithPostHogDistinctID
+	WithPostHogTimeout     = subscribers.WithPostHogTimeout
+	WithMixpanelHost       = subscribers.WithMixpanelHost
+	WithMixpanelAPISecret  = subscribers.WithMixpanelAPISecret
+	WithMixpanelDistinctID = subscribers.WithMixpanelDistinctID
+	WithMixpanelTimeout    = subscribers.WithMixpanelTimeout
+	WithAmplitudeHost      = subscribers.WithAmplitudeHost
+	WithAmplitudeUserID    = subscribers.WithAmplitudeUserID
+	WithAmplitudeDeviceID  = subscribers.WithAmplitudeDeviceID
+	WithAmplitudeTimeout   = subscribers.WithAmplitudeTimeout
+	WithWebhookHeaders     = subscribers.WithWebhookHeaders
+	WithWebhookTimeout     = subscribers.WithWebhookTimeout
+)
 
-func newOTLPExporter(ctx context.Context, cfg *Config) (trace.SpanExporter, error) {
-	if cfg.Protocol == ProtocolHTTP {
-		httpOpts := []otlptracehttp.Option{
-			otlptracehttp.WithEndpoint(cfg.Endpoint),
-			otlptracehttp.WithHeaders(cfg.OTLPHeaders),
-			otlptracehttp.WithTimeout(cfg.BatchTimeout + 5*time.Second),
-		}
-		if cfg.Insecure {
-			httpOpts = append(httpOpts, otlptracehttp.WithInsecure())
-		}
-		return otlptracehttp.New(ctx, httpOpts...)
-	}
+// Re-export logging functions
+var (
+	NewTraceHandler  = logging.NewTraceHandler
+	WithTraceContext = logging.WithTraceContext
+	TraceFields      = logging.TraceFields
+)
 
-	grpcOpts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(cfg.Endpoint),
-		otlptracegrpc.WithHeaders(cfg.OTLPHeaders),
-		otlptracegrpc.WithTimeout(cfg.BatchTimeout + 5*time.Second),
-	}
-	if cfg.Insecure {
-		grpcOpts = append(grpcOpts, otlptracegrpc.WithInsecure())
-	}
-	return otlptracegrpc.New(ctx, grpcOpts...)
-}
+// Re-export logging types
+type (
+	TraceHandler = logging.TraceHandler
+)
 
-// applyBackendPreset adjusts config for common vendors while staying OTLP-first.
-func applyBackendPreset(cfg *Config) {
-	switch strings.ToLower(cfg.BackendPreset) {
-	case "datadog", "dd":
-		if cfg.Endpoint == "" || cfg.Endpoint == "localhost:4318" {
-			cfg.Endpoint = "api.datadoghq.com:443"
-		}
-		cfg.Protocol = ProtocolGRPC
-		cfg.Insecure = false
-		ensureHeaders(cfg)
-		if key := os.Getenv("DD_API_KEY"); key != "" {
-			cfg.OTLPHeaders["DD-API-KEY"] = key
-		}
-		cfg.OTLPHeaders["X-Datadog-Origin"] = "otlp"
-	case "honeycomb", "hny":
-		if cfg.Endpoint == "" || cfg.Endpoint == "localhost:4318" {
-			cfg.Endpoint = "api.honeycomb.io:443"
-		}
-		cfg.Protocol = ProtocolHTTP
-		cfg.Insecure = false
-		ensureHeaders(cfg)
-		if key := os.Getenv("HONEYCOMB_API_KEY"); key != "" {
-			cfg.OTLPHeaders["x-honeycomb-team"] = key
-		}
-		if dataset := os.Getenv("HONEYCOMB_DATASET"); dataset != "" {
-			cfg.OTLPHeaders["x-honeycomb-dataset"] = dataset
-		}
-	case "grafana", "grafana-cloud", "grafana_cloud":
-		if cfg.Endpoint == "" || cfg.Endpoint == "localhost:4318" {
-			cfg.Endpoint = "otlp-gateway-prod.grafana.net:443"
-		}
-		cfg.Protocol = ProtocolGRPC
-		cfg.Insecure = false
-		ensureHeaders(cfg)
-		if key := os.Getenv("GRAFANA_OTLP_API_KEY"); key != "" {
-			cfg.OTLPHeaders["Authorization"] = "Bearer " + key
-		}
-	default:
-		// OTLP defaults already set
-	}
-}
-
-func ensureHeaders(cfg *Config) {
-	if cfg.OTLPHeaders == nil {
-		cfg.OTLPHeaders = make(map[string]string)
-	}
-}
+// Re-export option functions
+var (
+	WithService            = autotel.WithService
+	WithServiceVersion     = autotel.WithServiceVersion
+	WithEnvironment        = autotel.WithEnvironment
+	WithEndpoint           = autotel.WithEndpoint
+	WithProtocol           = autotel.WithProtocol
+	WithSampler            = autotel.WithSampler
+	WithInsecure           = autotel.WithInsecure
+	WithRateLimit          = autotel.WithRateLimit
+	WithCircuitBreaker     = autotel.WithCircuitBreaker
+	WithPIIRedaction       = autotel.WithPIIRedaction
+	WithAdaptiveSampler    = autotel.WithAdaptiveSampler
+	WithDebug              = autotel.WithDebug
+	WithSubscribers        = autotel.WithSubscribers
+	WithBackend            = autotel.WithBackend
+	WithOTLPHeaders        = autotel.WithOTLPHeaders
+	WithSpanExporters      = autotel.WithSpanExporters
+	WithSpanProcessors     = autotel.WithSpanProcessors
+	WithBatchTimeout       = autotel.WithBatchTimeout
+	WithMaxQueueSize       = autotel.WithMaxQueueSize
+	WithMaxExportBatchSize = autotel.WithMaxExportBatchSize
+	WithEventQueue         = autotel.WithEventQueue
+	WithEventBackoff      = autotel.WithEventBackoff
+	WithEventRetry        = autotel.WithEventRetry
+	WithMetrics           = autotel.WithMetrics
+	WithMetricExporters   = autotel.WithMetricExporters
+	WithMetricInterval    = autotel.WithMetricInterval
+)
